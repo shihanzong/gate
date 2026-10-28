@@ -16,6 +16,7 @@ import csv
 import io
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -98,6 +99,21 @@ OPTIMAL_API = os.environ.get("OPTIMAL_API", "https://cf.090227.xyz/ct?ips=6&port
 NODES_URL = os.environ.get("NODES_URL", "https://shihanzong.github.io/gate/nodes.txt")
 
 # ---------------------------------------------------------------------------
+# 第二货源: 公共 SOCKS5 免费代理列表 (与 VPN Gate 节点合并; 源失败不影响主源)
+# ---------------------------------------------------------------------------
+EXTRA_SOCKS_JSON = os.environ.get(
+    "EXTRA_SOCKS_JSON",
+    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies.json",
+)
+EXTRA_SAMPLE = int(os.environ.get("EXTRA_SAMPLE", "120"))
+EXCLUDE_COUNTRIES = {
+    c.strip().upper()
+    for c in os.environ.get("EXCLUDE_COUNTRIES", "CN").split(",")
+    if c.strip()
+}
+MAX_NODES_TOTAL = int(os.environ.get("MAX_NODES_TOTAL", "150"))
+
+# ---------------------------------------------------------------------------
 # 日志
 # ---------------------------------------------------------------------------
 _section = None
@@ -140,7 +156,37 @@ def fetch_vpngate():
             return rows, "github-mirror"
     except Exception as exc:
         log("VPN GATE", f"回退镜像也失败: {exc}")
-    die("VPN Gate 官方 API 与回退镜像均不可用, 数据源完全失败")
+    log("VPN GATE", "主源与镜像均不可用, 本次仅依赖第二货源")
+    return [], "unavailable"
+
+def fetch_extra_socks():
+    """第二货源: 公共 SOCKS5 列表(带国家码, 预排除指定国家后随机抽样)。"""
+    try:
+        resp = requests.get(EXTRA_SOCKS_JSON, timeout=HTTP_TIMEOUT, headers={"User-Agent": "Mozilla/5.0 (gate-checker)"})
+        resp.raise_for_status()
+        items = resp.json()
+    except Exception as exc:
+        log("EXTRA SOURCE", f"公共 SOCKS5 源获取失败(不影响主源): {exc}")
+        return []
+    candidates = []
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict) or item.get("protocol") != "socks5":
+            continue
+        host = str(item.get("host") or "").strip()
+        port = item.get("port")
+        if not host or not isinstance(port, int) or not (1 <= port <= 65535):
+            continue
+        geo = item.get("geolocation") or {}
+        cc = str((geo.get("country") or {}).get("iso_code") or "").strip().upper()
+        if cc in EXCLUDE_COUNTRIES:
+            continue
+        candidates.append({"host": host, "port": port, "country": "", "country_code": cc})
+    log("EXTRA SOURCE", f"公共 SOCKS5 候选(排除 {sorted(EXCLUDE_COUNTRIES) or '无'} 后): {len(candidates)}")
+    random.shuffle(candidates)
+    sampled = candidates[:EXTRA_SAMPLE]
+    log("EXTRA SOURCE", f"随机抽样送检: {len(sampled)}")
+    return sampled
+
 
 def parse_csv(text):
     lines = [ln for ln in text.splitlines() if ln.strip()]
@@ -323,11 +369,16 @@ def classify_network(host, exit_org, is_datacenter=None):
     if re.match(r"^vpn\d{5,}", h) or re.match(r"^vpnv\d+", h): return "residential"
     return "unknown"
 
-def check_one(node, session):
-    url = WORKER_CHECK_URL + quote(f"{node['host']}:{node['port']}", safe="")
+def check_one(node, session, protocol="sstp"):
+    if protocol == "sstp":
+        url = WORKER_CHECK_URL + quote(f"{node['host']}:{node['port']}", safe="")
+        link = f"sstp://vpn:vpn@{node['host']}:{node['port']}"
+    else:
+        url = WORKER_CHECK_URL.split("?", 1)[0] + f"?{protocol}=" + quote(f"{node['host']}:{node['port']}", safe="")
+        link = f"{protocol}://{node['host']}:{node['port']}"
     out = dict(node)
-    out["protocol"] = "sstp"
-    out["link"] = f"sstp://vpn:vpn@{node['host']}:{node['port']}"
+    out["protocol"] = protocol
+    out["link"] = link
     out["status"] = "failed"
     out["checked_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     out["exit"] = None
@@ -369,10 +420,10 @@ def check_one(node, session):
         out["worker_error"] = True
         return out
 
-def check_all(nodes, session):
+def check_all(nodes, session, protocol="sstp"):
     results = []
     with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
-        futures = [pool.submit(check_one, n, session) for n in nodes]
+        futures = [pool.submit(check_one, n, session, protocol) for n in nodes]
         for fut in as_completed(futures):
             results.append(fut.result())
     return results
@@ -427,17 +478,19 @@ def build_nodes_text(data, edge_hosts):
     for cname, grp in ordered:
         code = str(grp.get("code") or "?").upper()
         zh = COUNTRY_ZH.get(code) or (code if code and code != "?" else cname)
-        nodes = sorted(grp["nodes"], key=lambda n: (0 if n.get("residential") == "residential" else 1, n.get("latency_ms") is None, n.get("latency_ms") or 0, n.get("host") or ""))
+        nodes = sorted(grp["nodes"], key=lambda n: (n.get("_rank", 0), 0 if n.get("residential") == "residential" else 1, n.get("latency_ms") is None, n.get("latency_ms") or 0, n.get("host") or ""))
         res_nodes = [n for n in nodes if n.get("residential") == "residential"]
         dc_nodes = [n for n in nodes if n.get("residential") != "residential"]
         for i, n in enumerate(res_nodes, 1):
             entry = edge[idx % len(edge)]
             idx += 1
-            lines.append(f"{entry}#{zh}-住宅-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
+            lines.append(f"{entry}#{zh}-住宅-{i:02d}${n['link']}")
         for i, n in enumerate(dc_nodes, 1):
             entry = edge[idx % len(edge)]
             idx += 1
-            lines.append(f"{entry}#{zh}-机房-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
+            lines.append(f"{entry}#{zh}-机房-{i:02d}${n['link']}")
+    if MAX_NODES_TOTAL > 0:
+        lines = lines[:MAX_NODES_TOTAL]
     return "\n".join(lines) + "\n"
 
 def write_outputs(data, edge_hosts):
@@ -472,16 +525,12 @@ def main():
     session = requests.Session()
     rows, source = fetch_vpngate()
     raw_count = len(rows)
-    if raw_count == 0:
-        die("VPN Gate 返回 0 个原始节点 (数据源异常, 不允许生成空结果)")
 
     sstp_nodes = to_sstp_nodes(rows)
     sstp_count = len(sstp_nodes)
-    if sstp_count == 0:
-        die(f"从 {raw_count} 个原始节点中没有解析出任何 SSTP(TCP) 节点 — 数据格式可能已变化, 需要人工适配")
     uniq = dedupe(sstp_nodes)
 
-    if MAX_CHECK_NODES > 0:
+    if MAX_CHECK_NODES > 0 and uniq:
         uniq = uniq[:MAX_CHECK_NODES]
 
     log("VPN GATE", f"获取原始节点: {raw_count}")
@@ -490,7 +539,7 @@ def main():
 
     log("CLOUDFLARE WORKER", f"提交检测: {len(uniq)} (并发 {CONCURRENCY}, 单请求超时 {CHECK_TIMEOUT}s)")
     t0 = time.time()
-    results = check_all(uniq, session)
+    results = check_all(uniq, session) if uniq else []
     elapsed = time.time() - t0
 
     success = [r for r in results if r.get("success")]
@@ -504,17 +553,41 @@ def main():
     if uniq and not success and len(worker_errors) == len(uniq):
         die("Worker 全部请求异常, 检测服务不可用 — 本次运行判定失败 (不生成空结果)")
 
-    data = build_outputs(results, raw_count, sstp_count, source)
-    log("RESULT", f"可用节点: {len(success)}")
+    # 第二货源: 公共 SOCKS5 (失败/为空不影响主源)
+    extra_ok = []
+    if EXTRA_SAMPLE > 0:
+        extra_candidates = fetch_extra_socks()
+        if extra_candidates:
+            t1 = time.time()
+            extra_results = check_all(extra_candidates, session, protocol="socks5")
+            for r in extra_results:
+                if not r.get("success"):
+                    continue
+                exit_info = r.get("exit") or {}
+                cc = str(exit_info.get("country_code") or r.get("country_code") or "").strip().upper()
+                if cc in EXCLUDE_COUNTRIES:
+                    continue
+                r["country_code"] = cc or "??"
+                r["country"] = COUNTRY_ZH.get(cc) or exit_info.get("country") or "未知"
+                r["_rank"] = 1
+                extra_ok.append(r)
+            log("EXTRA SOURCE", f"公共 SOCKS5 存活并入: {len(extra_ok)} (耗时 {time.time() - t1:.1f}s)")
+
+    if not success and not extra_ok:
+        die("主源与第二货源均无存活节点, 本次运行判定失败 (不生成空结果)")
+
+    all_results = results + extra_ok
+    data = build_outputs(all_results, raw_count, sstp_count, source)
+    log("RESULT", f"可用节点: {len(all_results)}")
     log("RESULT", f"国家数量: {data['stats']['countries']}")
 
     # 动态拉取 API 并与静态优选域名混合
     edge_hosts = get_combined_edge_hosts()
 
     data_path, html_path, nodes_path = write_outputs(data, edge_hosts)
-    log("WEBSITE", f"生成 {os.path.relpath(data_path, REPO_DIR)}")
-    log("WEBSITE", f"生成 {os.path.relpath(html_path, REPO_DIR)}")
-    log("WEBSITE", f"生成 {os.path.relpath(nodes_path, REPO_DIR)}")
+    log("WEBSITE", f"生成 {os.path.basename(data_path)}")
+    log("WEBSITE", f"生成 {os.path.basename(html_path)}")
+    log("WEBSITE", f"生成 {os.path.basename(nodes_path)}")
     log("USAGE", f"自动轮换: 把 {NODES_URL} 填入 edgetunnel 后台「自定义优选IP」框 (一次配置, 之后自动更新)")
     log("WEBSITE", "完成 (GitHub Pages 部署由 workflow 执行)")
 
