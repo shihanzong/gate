@@ -1,6 +1,11 @@
 name: VPN Gate Node Check
 
 on:
+  schedule:
+    # 每 2 小时自动运行一次(整点)。想改频率参考:
+    #   每小时 0 * * * *  ｜ 每 4 小时 0 */4 * * *  ｜ 每 12 小时 0 */12 * * *  ｜ 每天 0 0 * * *
+    # 注意: - cron: 前面必须正好 4 个空格, 缩进错了 GitHub 会静默忽略(不报错、也不运行)
+    - cron: "0 */2 * * *"
   workflow_dispatch:
 
 permissions:
@@ -31,8 +36,12 @@ jobs:
       - name: Get VPN Gate nodes + check via Cloudflare Worker + build page
         run: python vpngate.py
         env:
-          # 已部署的检测 Worker (不要改动: 检测统一走这里)
-          CHECK_WORKER: "https://你的域名/check?sstp=vpn:vpn@"
+          # 【必改】检测 Worker 地址, 读取 GitHub Secret「DOMAIN」
+          # 配置入口: 仓库 Settings → Secrets and variables → Actions → New repository secret
+          #   Name   = DOMAIN        (必须全大写)
+          #   Secret = https://check-sstp.你的用户名.workers.dev/check?sstp=vpn:vpn@
+          #            (结尾的 @ 必须保留, 前后不能有空格/换行)
+          CHECK_WORKER: ${{ secrets.DOMAIN }}
           CHECK_CONCURRENCY: "32"
           CHECK_TIMEOUT: "90"
 
@@ -68,4 +77,4 @@ jobs:
         uses: actions/deploy-pages@v4
 
       - name: Show site URL
-        run: 'echo "site: https://仓库用户名.github.io/gate/ (deploy outcome: ${{ steps.deployment.outcome }})"'
+        run: 'echo "site: https://你的GitHub用户名.github.io/gate/ (deploy outcome: ${{ steps.deployment.outcome }})"'
